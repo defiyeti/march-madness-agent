@@ -1,0 +1,459 @@
+/**
+ * BuildContext.ts
+ * March Madness News Agent
+ * Built on EigenCompute + AgentKit
+ *
+ * Audience: Data-oriented enthusiasts who want real-time bracket intelligence,
+ * odds movement, advanced metrics, and predictive signals — not just headlines.
+ */
+
+import { BuildContext } from "@eigencompute/agentkit";
+
+// ─────────────────────────────────────────────
+// AGENT IDENTITY
+// ─────────────────────────────────────────────
+
+export const AGENT_NAME = "BracketPulse";
+export const AGENT_VERSION = "1.0.0";
+export const TOURNAMENT_YEAR = 2026;
+
+// ─────────────────────────────────────────────
+// SYSTEM PROMPT
+// ─────────────────────────────────────────────
+
+const SYSTEM_PROMPT = `
+You are BracketPulse — a hyper-analytical March Madness intelligence agent built for data enthusiasts.
+Your job is NOT to surface generic sports news. Your job is to surface SIGNAL.
+
+Core Behavior:
+- Lead every insight with a quantified claim (stat, odds shift, efficiency delta, seed history, etc.)
+- Prioritize live and near-real-time data feeds over static content
+- Always flag the DIRECTION and MAGNITUDE of change, not just the current state
+  (e.g., "KenPom efficiency rating dropped 4.1 points after losing their PG to injury")
+- Cross-reference at least 2 data sources before asserting a trend
+- When surfacing odds movement, note whether sharp (books) or public (retail) money is driving it
+- Bracket-relevant signals > general team news. Filter ruthlessly.
+- Distinguish between sample size noise and meaningful trends.
+- Always include the date/time of the most recent data point you're referencing.
+
+Tone: Precise. Confident. Concise. Like a quant who loves basketball.
+
+Sections you always maintain:
+1. 🚨 LIVE ALERTS — Real-time injury, line move, or lineup alerts in the last 2 hours
+2. 📊 ODDS DRIFT — Spread/moneyline/total movement with time-stamped deltas
+3. 🔬 EFFICIENCY SIGNALS — KenPom / BartTorvik / Haslametrics deltas since last game
+4. 🏥 INJURY FEED — Confirmed and rumored, with estimated bracket impact score (0–10)
+5. 📰 CONTEXTUAL NEWS — Only bracket-relevant editorial context; summarized in ≤2 sentences
+6. 🎯 BRACKET VOLATILITY INDEX — Your proprietary composite of upset probability shifts
+`;
+
+// ─────────────────────────────────────────────
+// DATA FEEDS
+// ─────────────────────────────────────────────
+
+const DATA_FEEDS = {
+
+  /**
+   * ODDS & LINES
+   * Real-time spread, ML, and total movement from major books.
+   * Sharp/public split is critical for signal quality.
+   */
+  odds: [
+    {
+      id: "the_odds_api",
+      label: "The Odds API — Multi-book aggregator",
+      endpoint: "https://api.the-odds-api.com/v4/sports/basketball_ncaab/odds",
+      params: {
+        apiKey: process.env.ODDS_API_KEY,
+        regions: "us",
+        markets: "spreads,h2h,totals",
+        oddsFormat: "american",
+      },
+      pollIntervalMs: 60_000, // 1 min
+      signalFields: ["spread", "moneyline", "total", "lastUpdate"],
+      alertThresholds: {
+        spreadMovePoints: 1.5,   // Alert if line moves ≥ 1.5 pts
+        mlMovePercent: 8,        // Alert if ML odds shift ≥ 8%
+        totalMovePoints: 2.0,
+      },
+    },
+    {
+      id: "action_network",
+      label: "Action Network — Public vs. sharp split",
+      endpoint: "https://api.actionnetwork.com/web/v1/games",
+      params: {
+        sport: "ncaab",
+        tournamentOnly: true,
+      },
+      pollIntervalMs: 120_000,
+      signalFields: [
+        "publicBettingPercent",
+        "sharpBettingPercent",
+        "lineMovement",
+        "steamMoves",
+        "reverseLineMovement",  // Key signal: line moves against public money
+      ],
+    },
+    {
+      id: "pinnacle_feed",
+      label: "Pinnacle — Sharpest closing lines in market",
+      endpoint: "https://api.pinnacle.com/v1/odds/matchups",
+      params: { sportId: 4, leagueId: 505 }, // NCAAB March Tournament
+      pollIntervalMs: 90_000,
+      note: "Pinnacle closing line is gold standard for true market consensus.",
+    },
+  ],
+
+  /**
+   * ADVANCED EFFICIENCY METRICS
+   * The lifeblood of bracket analysis. Track deltas, not just current rankings.
+   */
+  efficiency: [
+    {
+      id: "kenpom",
+      label: "KenPom — Adjusted efficiency ratings",
+      endpoint: "https://kenpom.com/api/teams",       // Unofficial; scrape if needed
+      scrapeUrl: "https://kenpom.com",
+      pollIntervalMs: 3_600_000, // 1 hr (KenPom updates daily)
+      signalFields: [
+        "adjEM",          // Adjusted Efficiency Margin (key composite)
+        "adjOE",          // Adjusted Offensive Efficiency
+        "adjDE",          // Adjusted Defensive Efficiency
+        "adjT",           // Adjusted Tempo
+        "luck",           // Pythagorean luck factor
+        "strengthOfSchedule",
+        "nonConfSOS",
+      ],
+      alertThresholds: {
+        adjEMDeltaGameOverGame: 2.0,  // Alert if team's adjEM shifts > 2.0 pts
+      },
+    },
+    {
+      id: "barttorvik",
+      label: "BartTorvik (T-Rank) — Four Factors + resume",
+      endpoint: "https://barttorvik.com/trank.php",
+      scrapeUrl: "https://barttorvik.com",
+      pollIntervalMs: 3_600_000,
+      signalFields: [
+        "barthagRating",
+        "adjOE",
+        "adjDE",
+        "efgPct",          // Effective FG%
+        "tovPct",          // Turnover rate
+        "orbPct",          // Offensive rebound rate
+        "ftRate",          // Free throw rate
+        "quadOneRecord",   // Quad 1 wins — critical for seed legitimacy
+        "predictedSeed",
+      ],
+    },
+    {
+      id: "haslametrics",
+      label: "Haslametrics — Player-adjusted team ratings",
+      endpoint: "https://haslametrics.com/ratings.php",
+      pollIntervalMs: 7_200_000,
+      signalFields: [
+        "playerAdjustedRating",
+        "injuryAdjustedRating",  // Recalculates team strength post-injury
+        "matchupRating",         // Head-to-head projected dominance
+      ],
+      note: "Especially useful post-injury — recalculates team strength with roster adjustments.",
+    },
+    {
+      id: "evanmiya",
+      label: "EvanMiya — BARTHAG + Player Impact Estimates",
+      endpoint: "https://evanmiya.com/api/teams",
+      pollIntervalMs: 3_600_000,
+      signalFields: [
+        "offBPR",   // Offensive Box Plus/Minus
+        "defBPR",   // Defensive Box Plus/Minus
+        "PIE",      // Player Impact Estimate
+        "predictedSpread",
+      ],
+    },
+  ],
+
+  /**
+   * INJURY & ROSTER INTELLIGENCE
+   * The single highest-impact variable in bracket volatility.
+   */
+  injuries: [
+    {
+      id: "rotowire_ncaab",
+      label: "RotoWire — NCAAB injury reports",
+      endpoint: "https://api.rotowire.com/Basketball/v1/ncaab/injuries",
+      params: { apiKey: process.env.ROTOWIRE_API_KEY },
+      pollIntervalMs: 300_000, // 5 min
+      signalFields: [
+        "playerName",
+        "team",
+        "status",        // Out / Questionable / Day-To-Day / Probable
+        "position",
+        "injuryType",
+        "estimatedReturn",
+        "reportedAt",
+      ],
+      enrichment: {
+        // Cross-reference player usage rate to auto-score bracket impact
+        bracketImpactScore: true,   // 0–10 scale, derived from player's KenPom usage%
+        replacementLevelDelta: true,
+      },
+    },
+    {
+      id: "beat_reporters",
+      label: "Beat Reporter Twitter/X accounts — fastest injury signals",
+      type: "social_monitor",
+      accounts: [
+        "@WorstOfItAll",       // General NCAAB aggregator
+        "@InsidetheKP",        // KenPom-adjacent analysis
+        "@gavinsheinin",       // CBS Sports NCAAB
+        "@willheimann",        // CBS Sports
+        "@GaryParrishCBS",     // Insider
+        "@DanWetzel",          // Yahoo Sports
+      ],
+      keywords: ["injury", "out", "questionable", "won't play", "scratch", "ankle", "knee", "concussion"],
+      pollIntervalMs: 60_000,
+      note: "Beat reporter tweets consistently lead official reports by 30–90 minutes.",
+    },
+  ],
+
+  /**
+   * BRACKET STRUCTURE & HISTORICAL SEED DATA
+   * Context for probabilistic analysis.
+   */
+  bracketData: [
+    {
+      id: "ncaa_live_bracket",
+      label: "NCAA.com — Official live bracket + results",
+      endpoint: "https://data.ncaa.com/casablanca/bracket/basketball-men/d1/2026/bracket.json",
+      pollIntervalMs: 30_000, // 30 sec during live games
+      signalFields: [
+        "matchups",
+        "scores",
+        "gameStatus",
+        "venue",
+        "tipOffTime",
+      ],
+    },
+    {
+      id: "seed_historical",
+      label: "Seed history win rates (1985–2025)",
+      type: "static",
+      endpoint: "https://api.sports-reference.com/ncaab/tournament/seed-history",
+      data: {
+        // Baked-in historical upset rates by round for quick context injection
+        firstRoundUpsetRates: {
+          "12-over-5": 0.356,
+          "11-over-6": 0.370,
+          "10-over-7": 0.398,
+          "13-over-4": 0.208,
+          "14-over-3": 0.150,
+          "15-over-2": 0.067,
+          "16-over-1": 0.014,
+        },
+      },
+    },
+  ],
+
+  /**
+   * REAL-TIME GAME DATA
+   * Live score, possession, and momentum during tournament games.
+   */
+  liveGame: [
+    {
+      id: "espn_live",
+      label: "ESPN — Live game feed (score, possession, momentum)",
+      endpoint: "https://site.api.espn.com/apis/site/v2/sports/basketball/mens-college-basketball/scoreboard",
+      pollIntervalMs: 15_000, // 15 sec during live windows
+      signalFields: [
+        "score",
+        "possession",
+        "timeRemaining",
+        "period",
+        "winProbability",    // ESPN live win probability
+        "scoringRun",        // Current run (e.g., 9-0 run)
+        "teamStats",
+      ],
+    },
+    {
+      id: "sportsbetting_live_odds",
+      label: "Live in-game odds — DraftKings API",
+      endpoint: "https://sportsbook-nash.draftkings.com/sites/US-SB/api/v5/eventgroups/92483/categories/743",
+      pollIntervalMs: 10_000,
+      signalFields: ["liveSpread", "liveMl", "liveTotal", "currentOddsTimestamp"],
+    },
+  ],
+
+  /**
+   * PREDICTION MARKETS
+   * Crowd-sourced probabilistic consensus — independent of sportsbooks.
+   */
+  predictionMarkets: [
+    {
+      id: "polymarket",
+      label: "Polymarket — Championship winner probabilities",
+      endpoint: "https://gamma-api.polymarket.com/markets",
+      params: { slug: "ncaa-mens-basketball-2026" },
+      pollIntervalMs: 300_000,
+      signalFields: ["teamName", "impliedProbability", "priceChange24h", "volume"],
+    },
+    {
+      id: "fivethirtyeight_bpi",
+      label: "ESPN BPI Predictions (successor to 538)",
+      endpoint: "https://site.api.espn.com/apis/v2/sports/basketball/mens-college-basketball/bpi",
+      pollIntervalMs: 3_600_000,
+      signalFields: [
+        "bpi",              // Basketball Power Index
+        "projectedRecord",
+        "chanceToMakePlayoffs",
+        "tournamentWinPct",
+      ],
+    },
+  ],
+};
+
+// ─────────────────────────────────────────────
+// ALERT RULES
+// ─────────────────────────────────────────────
+
+const ALERT_RULES = [
+  {
+    id: "sharp_line_move",
+    label: "Sharp money line move",
+    trigger: "odds.spreadMovePoints >= 2.0 AND action_network.reverseLineMovement === true",
+    priority: "P0",
+    message: "SHARP MOVE: {{team}} line moved {{delta}} pts against {{publicPct}}% public action.",
+  },
+  {
+    id: "star_player_injury",
+    label: "Star player injury (impact ≥ 7)",
+    trigger: "injury.bracketImpactScore >= 7",
+    priority: "P0",
+    message: "🚨 BRACKET IMPACT: {{player}} ({{team}}) — {{status}}. Impact Score: {{score}}/10. AdjEM delta: -{{adjEMDelta}}.",
+  },
+  {
+    id: "kenpom_significant_move",
+    label: "KenPom adjEM delta > 2 pts",
+    trigger: "kenpom.adjEMDeltaGameOverGame >= 2.0",
+    priority: "P1",
+    message: "EFFICIENCY SIGNAL: {{team}} adjEM shifted {{delta}} pts. New rating: {{adjEM}} ({{rank}}).",
+  },
+  {
+    id: "live_upset_probability",
+    label: "Live upset probability spike",
+    trigger: "liveGame.winProbability_underdog >= 0.55 AND liveGame.pregameWinProbability_underdog < 0.30",
+    priority: "P0",
+    message: "⚡ LIVE UPSET ALERT: {{underdog}} ({{seed}}) now {{probability}}% likely to win vs {{favorite}}.",
+  },
+  {
+    id: "polymarket_swing",
+    label: "Prediction market championship swing",
+    trigger: "polymarket.priceChange24h >= 0.08", // 8% swing in 24h
+    priority: "P1",
+    message: "MARKET SIGNAL: {{team}} championship probability shifted {{delta}}% in 24h on Polymarket.",
+  },
+];
+
+// ─────────────────────────────────────────────
+// BRACKET VOLATILITY INDEX (BVI)
+// ─────────────────────────────────────────────
+
+/**
+ * Proprietary composite score (0–100) representing upset probability shift
+ * for a given matchup or team's path through the bracket.
+ *
+ * Inputs:
+ * - Line movement magnitude & direction (weight: 30%)
+ * - Injury impact score (weight: 30%)
+ * - KenPom/Torvik adjEM convergence (weight: 20%)
+ * - Historical seed upset rate (weight: 10%)
+ * - Prediction market movement (weight: 10%)
+ */
+const BRACKET_VOLATILITY_INDEX = {
+  id: "bvi",
+  label: "Bracket Volatility Index",
+  version: "1.0",
+  weights: {
+    lineMovement: 0.30,
+    injuryImpact: 0.30,
+    efficiencyConvergence: 0.20,
+    historicalSeedRate: 0.10,
+    predictionMarket: 0.10,
+  },
+  outputRange: [0, 100],
+  interpretation: {
+    "0–20": "Low volatility — chalk likely holds",
+    "21–45": "Moderate volatility — monitor closely",
+    "46–70": "High volatility — upset is live",
+    "71–100": "Extreme volatility — major bracket shift imminent",
+  },
+};
+
+// ─────────────────────────────────────────────
+// AGENT CONTEXT (BuildContext export)
+// ─────────────────────────────────────────────
+
+const context: BuildContext = {
+  agent: {
+    name: AGENT_NAME,
+    version: AGENT_VERSION,
+    systemPrompt: SYSTEM_PROMPT,
+    model: "claude-sonnet-4-20250514",
+    maxTokensPerResponse: 1200,
+    temperature: 0.3,        // Low temp = precise, data-first outputs
+    responseFormat: "structured_markdown",
+  },
+
+  dataFeeds: DATA_FEEDS,
+
+  alertRules: ALERT_RULES,
+
+  proprietaryModels: {
+    bracketVolatilityIndex: BRACKET_VOLATILITY_INDEX,
+  },
+
+  enrichmentPipeline: [
+    // Step 1: Ingest raw feeds
+    { step: "ingest", sources: ["odds", "efficiency", "injuries", "bracketData", "liveGame", "predictionMarkets"] },
+
+    // Step 2: Normalize team names across all sources (KenPom slugs ≠ ESPN IDs)
+    { step: "normalize", fn: "teamEntityResolution", lookupTable: "./data/team_id_map.json" },
+
+    // Step 3: Compute BVI for each active matchup
+    { step: "compute", fn: "bracketVolatilityIndex", inputs: ["odds", "injuries", "efficiency", "predictionMarkets"] },
+
+    // Step 4: Score and rank alerts by priority and recency
+    { step: "rank", fn: "alertPrioritizer", sortBy: ["priority", "dataFreshness", "bviDelta"] },
+
+    // Step 5: Inject into agent context with structured schema
+    { step: "inject", schema: "MarchMadnessAgentContext", compressionStrategy: "drop_stale_after_4h" },
+  ],
+
+  contextRefreshPolicy: {
+    duringLiveGames: 15_000,     // 15 sec
+    betweenGames: 300_000,       // 5 min
+    overnight: 3_600_000,        // 1 hr
+    selectionSunday: 30_000,     // 30 sec (bracket announcement day)
+  },
+
+  outputChannels: [
+    { id: "web_dashboard", format: "structured_markdown" },
+    { id: "slack_bot", format: "compact_alert", maxLength: 280 },
+    { id: "api_endpoint", format: "json", schema: "MarchMadnessResponse" },
+    { id: "email_digest", format: "html", cadence: "daily_8am_et" },
+  ],
+
+  environment: {
+    requiredEnvVars: [
+      "ODDS_API_KEY",
+      "ROTOWIRE_API_KEY",
+      "EIGEN_API_KEY",
+      "ANTHROPIC_API_KEY",
+      "PINNACLE_API_KEY",
+    ],
+    region: "us-east-1",
+    logLevel: "info",
+    datadogMetricsEnabled: true,
+  },
+};
+
+export default context;
